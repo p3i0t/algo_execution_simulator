@@ -48,6 +48,22 @@ __all__ = [
 REQUIRED = ("session", "symbol", "ts", "price", "volume")
 _SIDES = ("buy", "sell")
 
+# Fill-model scenarios. "ideal" reproduces the bar-VWAP fill assumption.
+# All others add the three realism terms documented in docs/CONCEPTS.md 2:
+#   lam   : fraction of the half-spread captured by passive fills
+#   pf    : probability a passive order fills within its bar (unfilled size
+#           crosses at the half-spread)
+#   theta : fraction of the predicted 1-min drift realized AFTER the average
+#           fill time of its bar (intra-bar timing decay of the signal)
+#   Y     : square-root impact coefficient,
+#           impact_bp = Y * sigma_1min_bp * sqrt(participation_in_bar)
+FILL_SCENARIOS: dict[str, dict] = {
+    "ideal": {"lam": 0.4, "pf": 1.0, "theta": 1.0, "Y": 0.0},
+    "optimistic": {"lam": 0.4, "pf": 0.8, "theta": 0.7, "Y": 0.5},
+    "neutral": {"lam": 0.2, "pf": 0.5, "theta": 0.5, "Y": 0.75},
+    "pessimistic": {"lam": 0.0, "pf": 0.3, "theta": 0.3, "Y": 1.0},
+}
+
 
 # ---------------------------------------------------------------- data prep
 
@@ -132,6 +148,8 @@ def _run_symbol_day(
     inst: bool,
     ema: float,
     passive_credit: float,
+    fm: dict,
+    sigma_bp: float,
 ) -> dict | None:
     nb = len(h)
     sgn = 1.0 if side == "buy" else -1.0
@@ -145,7 +163,7 @@ def _run_symbol_day(
     for b in range(nb):
         if Q <= 1e-14:
             break
-        m = float(np.clip(sgn * kappa * p_prev * 1e4, -0.69, 0.69)) if kappa else 0.0
+        m = float(np.clip(sgn * kappa * fm["theta"] * p_prev * 1e4, -0.69, 0.69)) if kappa else 0.0
         rem = 1.0 - (cum_curve[b - 1] if b > 0 else 0.0)
         slice_qty = Q * h[b] / max(rem, 1e-12) * float(np.exp(m))
         vhat_eff = prev_day_vol
@@ -162,7 +180,16 @@ def _run_symbol_day(
         px_b = px[b]
         if np.isfinite(px_b) and take > 0:
             half = 0.5 * (spr[b] if np.isfinite(spr[b]) else 2.0) / 1e4 * px_b
-            num += agg * (px_b + sgn * half) + pas * (px_b - sgn * passive_credit * half)
+            part_b = take * vhat_eff / max(vol[b], 1.0)
+            imp = fm["Y"] * sigma_bp * float(np.sqrt(min(part_b, 1.0))) / 1e4 * px_b
+            pas_fill = pas * fm["pf"]  # filled passively this bar
+            pas_cross = pas - pas_fill  # forced to cross (still behind)
+            lam = fm["lam"]
+            num += (
+                agg * (px_b + sgn * (half + imp))
+                + pas_fill * (px_b - sgn * lam * half + sgn * imp)
+                + pas_cross * (px_b + sgn * (half + imp))
+            )
             rnum += take * px_b
             den += take
             filled += take
@@ -192,6 +219,7 @@ def simulate(
     kappa: float = 0.0,
     passive_credit: float = 0.4,
     ema: float = 0.3,
+    fill_model: str = "ideal",
     sides: tuple[str, ...] = _SIDES,
 ) -> dict:
     """Simulate one strategy over all sessions. Returns fills + config.
@@ -200,11 +228,19 @@ def simulate(
     (institutional: weekday-conditioned curve, volume-clock re-sync, urgency
     pacing, passive/aggressive spread accounting). The signal tilt requires
     schedule="inst".
+
+    fill_model: "ideal" (bar-VWAP fills, no impact -- the original assumption),
+    or "optimistic" / "neutral" / "pessimistic" bracket scenarios adding
+    passive-fill risk, intra-bar signal decay and square-root impact (see
+    FILL_SCENARIOS).
     """
     if schedule not in ("uniform", "static", "inst"):
         raise ValueError(f"unknown schedule {schedule!r}")
     if kappa and schedule != "inst":
         raise ValueError("signal tilt requires schedule='inst'")
+    fm = FILL_SCENARIOS.get(fill_model)
+    if fm is None:
+        raise ValueError(f"unknown fill_model {fill_model!r}; one of {sorted(FILL_SCENARIOS)}")
     prep = prepare_bars(bars)
     sig_df = load_signal(tilt_signal) if tilt_signal is not None else None
     sessions = prep["session"].unique().sort().to_list()
