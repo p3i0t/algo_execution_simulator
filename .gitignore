@@ -5,3 +5,4 @@ outputs/
 *.egg-info/
 build/
 dist/
+.github/workflows/ci.yml - push after: gh auth refresh -h -s workflow
