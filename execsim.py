@@ -95,7 +95,7 @@ def volume_curve(  # noqa: ANN001 -- session id is any hashable
         .group_by("symbol", "bidx")
         .agg(h=pl.col("sh").mean())
     )
-    out = out.with_columns(h=pl.col("h").fill_nan(0.0))
+    out = out.with_columns(h=pl.col("h").fill_nan(0.0).fill_null(0.0))
     ssum = out.group_by("symbol").agg(s=pl.col("h").sum())
     out = (
         out.join(ssum, on="symbol")
