@@ -279,6 +279,8 @@ def simulate(
                 np.nansum(px * np.nan_to_num(vol)) / max(np.nansum(np.nan_to_num(vol)), 1e-12)
             )
             arrival = float(px[0])
+            rets = np.diff(px) / px[:-1]
+            sigma_bp = float(np.nanstd(rets) * 1e4) if np.isfinite(rets).any() else 5.0
             for side in sides:
                 o = _run_symbol_day(
                     h,
@@ -293,6 +295,8 @@ def simulate(
                     schedule == "inst",
                     ema,
                     passive_credit,
+                    fm,
+                    sigma_bp,
                 )
                 if o is None:
                     continue
