@@ -114,6 +114,124 @@ a shifted one.
 
 ---
 
+
+## 2.5 The fill model (detailed)
+
+The fill model answers one question: **given the quantity `q_b` the schedule
+wants to trade in bar b, at what price does it actually trade, and under what
+assumptions?** Everything in this section is implemented in
+`execsim.py` (`FILL_SCENARIOS`, `_run_symbol_day`).
+
+### Inputs
+
+| input | source | units |
+|---|---|---|
+| `q_b` | the schedule's target slice for bar b (fraction of session volume) | fraction, e.g. 3e-5 |
+| `px_b` | the bar's traded VWAP | price |
+| `spread_bps[b]` | the bar's quoted spread | bp |
+| `vol[b]` | the bar's traded volume | shares |
+| `V̂` | projected session volume (EMA of `realized_cum / curve_frac`, updated with bars **< b** only) | shares |
+| `p[b−1]` | signal: return forecast for bar b, made at bar b−1's close | dimensionless return |
+| `σ_1min` | per-symbol-day std of 1-min bar returns, ×10⁴ | bp |
+| scenario params `{λ, pf, θ, Y}` | see table below | — |
+
+### Step 1 — signal tilt with intra-bar decay
+
+```
+m_b = clip( κ · sgn · θ · p[b−1] · 10⁴ , −0.69, +0.69 )
+slice_b = Q · h[b] / (1 − cum_h[b−1]) · e^{m_b}
+```
+
+`θ` is the **intra-bar timing decay**: only that fraction of the predicted
+1-minute move is assumed to be realized *after* your fills land inside the
+bar (the rest is captured by faster traders). θ=1 assumes you act at the bar
+open; θ=0.3 (pessimistic) assumes 70% of the edge is gone.
+
+### Step 2 — participation cap
+
+```
+slice_b ≤ part · V̂ · h[b]
+```
+
+Predicted bar volume (never bar b's realized volume — causality). Excess
+demand carries to later bars.
+
+### Step 3 — passive / aggressive split
+
+```
+behind = max( Q · cum_h[b−1] − filled_so_far , 0 )
+agg_b  = min(behind, slice_b)        # crossed at market
+pas_b  = slice_b − agg_b             # rests at/near the touch
+```
+
+### Step 4 — passive fill probability
+
+```
+pas_fill_b  = pf · pas_b             # fills at the touch this bar
+pas_cross_b = (1 − pf) · pas_b       # could not rest -> crossed at market
+```
+
+### Step 5 — price formation
+
+```
+half_b     = ½ · spread_bps[b] / 10⁴ · px_b
+impact_b   = Y · σ_1min / 10⁴ · sqrt( q_b·V̂ / vol[b] ) · px_b
+   (square-root law in bar participation; capped at participation 1.0)
+
+buy :  aggressive fill price = px_b + half_b + impact_b
+       passive (filled)     = px_b − λ · half_b + impact_b
+       passive (crossed)    = px_b + half_b + impact_b
+sell : mirror image (sgn = −1 on every spread/impact term)
+```
+
+λ is the **passive capture**: how much of the half-spread a resting order
+earns on average (0 = fills at bar VWAP, 1 = fills at the far touch).
+
+### Step 6 — outputs
+
+Per bar: filled quantity and its all-in price. Aggregated per symbol-session:
+`exec` (volume-weighted all-in price), `raw_exec` (same fills at the plain
+bar VWAP — used for IS_day), `completion`, `agg_frac`. The simulator then
+computes IS vs day VWAP (raw) and IS vs arrival price (all-in).
+
+### Scenario table
+
+| scenario | λ (passive capture) | pf (passive fill prob) | θ (signal decay) | Y (impact) |
+|---|---:|---:|---:|---:|
+| `ideal` | 0.4 | 1.0 | 1.0 | 0 |
+| `optimistic` | 0.4 | 0.8 | 0.7 | 0.5 |
+| `neutral` | 0.2 | 0.5 | 0.5 | 0.75 |
+| `pessimistic` | 0.0 | 0.3 | 0.3 | 1.0 |
+
+`ideal` reproduces the original bar-VWAP assumption up to the passive credit
+(λ=0.4): it is the optimistic-spread baseline the historical study used.
+
+### When impact is and is not negligible
+
+With square-root participation `√(q_b·V̂ / vol[b]) ≈ √0.01 = 0.1` (order = 1%
+of session volume spread across ~330 bars) and `σ_1min ≈ 8 bp`:
+
+```
+impact ≈ Y · 8 bp · 0.1 ≈ 0.8·Y bp  per bar slice  ->  ≲1 bp per order total
+```
+
+i.e. second-order vs the half-spread at this size. It stops being negligible
+when (i) the tilt concentrates fills (participation rises to several % of the
+bar), or (ii) the order scales to ~10% of session volume (`√0.10 = 0.32`, and
+permanent impact starts stacking across bars). The pessimistic bracket exists
+to contain exactly these two effects.
+
+### What the fill model does NOT model
+
+Queue position and partial-fill dynamics inside the resting order; adverse
+selection of passive fills (passive fills skew toward adverse moves); latency
+(order action at the bar open is assumed instantaneous); self-crossing and
+order-management costs; multi-venue routing. These are all directions in
+which the simulated fills are *generous*; the scenario brackets are the
+honesty device, and live order data is the only calibration that removes
+them.
+
+
 ## 3. Algorithms
 
 ### 3.1 Uniform
